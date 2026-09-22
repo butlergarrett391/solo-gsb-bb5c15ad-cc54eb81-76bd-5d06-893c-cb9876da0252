@@ -1889,6 +1889,183 @@ def _exercise_api(client: "TestClient") -> None:
     )
 
 
+def test_counter_series_archive_api(tmp_db: str = "/tmp/tsad_smoke_archive.db") -> None:
+    """计数器读数分批归档：乱序 / 重叠合并、幂等 / 异值 409、参数固定 / 不一致
+    409、全序列重算、查询 404、非法点 422。"""
+    import json as _json
+    import os
+
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    os.environ["DB_PATH"] = tmp_db
+
+    from app import database
+
+    database.DB_PATH = tmp_db
+    database.init_db(tmp_db)
+
+    base = "http://testserver/api/v1/counter-series"
+    with TestClient(app) as client:
+        # 首批：乱序 3 点（00:00/00:02/00:01），携带回卷 / 断档参数
+        r = client.post(f"{base}/meter-a/readings", json={
+            "max_counter": 1000, "wrap_tolerance": 5, "max_gap_seconds": 300,
+            "points": [
+                {"timestamp": "2026-09-22T00:00:00Z", "value": 100.0},
+                {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},
+                {"timestamp": "2026-09-22T00:01:00Z", "value": 110.0},
+            ],
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["submitted_point_count"] == 3
+        assert body["new_point_count"] == 3
+        assert body["duplicate_point_count"] == 0
+        assert body["received_point_count"] == 3
+        assert body["point_count"] == 3
+        # 乱序提交后结果按时间重算：100->110 normal、110->998 normal
+        assert [iv["reason"] for iv in body["intervals"]] == ["normal", "normal"]
+        assert body["total_delta"] == 898.0
+        assert body["max_counter"] == 1000.0 and body["max_gap_seconds"] == 300.0
+
+        # 第二批：重叠点同值（幂等）+ 批内同值重复 + 新点造成 wrap 区间
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [
+                {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},  # 与已存同值
+                {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},  # 批内同值
+                {"timestamp": "2026-09-22T00:03:00Z", "value": 5.0},    # wrap：998 -> 5
+                {"timestamp": "2026-09-22T00:04:00Z", "value": 20.0},
+            ],
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["submitted_point_count"] == 4
+        assert body["new_point_count"] == 2
+        assert body["duplicate_point_count"] == 2
+        assert body["received_point_count"] == 5
+        reasons = [iv["reason"] for iv in body["intervals"]]
+        assert reasons == ["normal", "normal", "wrap", "normal"], reasons
+        assert body["wrap_count"] == 1
+        # wrap 增量 (1000-998)+5=7；总 10+888+7+15 = 920
+        assert body["total_delta"] == 920.0
+
+        # 后补一个很早的点（乱序、与全部历史区间重叠）：受影响区间与 epoch 全部重算
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [{"timestamp": "2026-09-21T23:59:00Z", "value": 90.0}],
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["new_point_count"] == 1 and body["received_point_count"] == 6
+        assert body["point_count"] == 6 and body["interval_count"] == 5
+        assert body["intervals"][0]["start_time"] == "2026-09-21T23:59:00+00:00"
+        assert body["intervals"][0]["reason"] == "normal"
+        # epoch 按新序列重排，首区间仍属 epoch 0
+        assert body["epochs"][0]["start_time"] == "2026-09-21T23:59:00+00:00"
+
+        # 省略参数：沿用首批（返回体回显已存参数）
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [{"timestamp": "2026-09-22T02:00:00Z", "value": 30.0}],
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["max_counter"] == 1000.0
+        assert body["wrap_tolerance"] == 5.0
+        assert body["max_gap_seconds"] == 300.0
+        # 00:04 -> 02:00 跨度 6960s > 300：unknown，切断 epoch
+        assert body["intervals"][-1]["reason"] == "unknown"
+        assert body["unknown_count"] == 1
+
+        # 查询接口：返回最新计算结果 + 已接收点数
+        r = client.get(f"{base}/meter-a")
+        assert r.status_code == 200, r.text
+        got = r.json()
+        assert got["received_point_count"] == 7
+        assert got["point_count"] == 7
+        assert "submitted_point_count" not in got  # 查询响应不含批次字段
+        assert got["total_delta"] == body["total_delta"]
+
+        # 未知序列 → 404
+        r = client.get(f"{base}/no-such-meter")
+        assert r.status_code == 404 and "不存在" in r.text
+
+        # 超长 series_id → 422（路径参数约束，与检测接口的 series_id 长度一致）
+        r = client.post(f"{base}/{'x' * 129}/readings", json={
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 1.0}],
+        })
+        assert r.status_code == 422
+
+        # 同时间戳异值 → 409，且不写入（received 仍为 7）
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 123.0}],
+        })
+        assert r.status_code == 409 and "同时间戳" in r.text
+        r = client.get(f"{base}/meter-a")
+        assert r.json()["received_point_count"] == 7
+
+        # 批内同时间戳异值 → 409
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [
+                {"timestamp": "2026-09-22T03:00:00Z", "value": 1.0},
+                {"timestamp": "2026-09-22T03:00:00Z", "value": 2.0},
+            ],
+        })
+        assert r.status_code == 409
+
+        # 参数不一致 → 409（max_counter）
+        r = client.post(f"{base}/meter-a/readings", json={
+            "max_counter": 2000,
+            "points": [{"timestamp": "2026-09-22T03:00:00Z", "value": 31.0}],
+        })
+        assert r.status_code == 409 and "max_counter" in r.text
+
+        # 显式提交 null 与已存非 null 不一致 → 409（区分「省略」与「显式 null」）
+        r = client.post(f"{base}/meter-a/readings", json={
+            "max_gap_seconds": None,
+            "points": [{"timestamp": "2026-09-22T03:00:00Z", "value": 31.0}],
+        })
+        assert r.status_code == 409 and "max_gap_seconds" in r.text
+        # 冲突批次整体回滚：该时间点不存在
+        r = client.get(f"{base}/meter-a")
+        assert r.json()["received_point_count"] == 7
+
+        # 非法点 → 422：空批 / value NaN / 非法时间戳 / wrap_tolerance > max_counter
+        r = client.post(f"{base}/meter-a/readings", json={"points": []})
+        assert r.status_code == 422
+        r = client.post(f"{base}/meter-a/readings", content=_json.dumps({
+            "points": [{"timestamp": "2026-09-22T04:00:00Z", "value": float("nan")}],
+        }), headers={"Content-Type": "application/json"})
+        assert r.status_code == 422
+        r = client.post(f"{base}/meter-a/readings", json={
+            "points": [{"timestamp": "not-a-time", "value": 1.0}],
+        })
+        assert r.status_code == 422 and "时间戳" in r.text
+        r = client.post(f"{base}/meter-b/readings", json={
+            "max_counter": 10, "wrap_tolerance": 11,
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 1.0}],
+        })
+        assert r.status_code == 422 and "wrap_tolerance" in r.text
+
+        # 新序列首批省略参数合法；单点提交后 interval_count=0、rate=null
+        r = client.post(f"{base}/meter-c/readings", json={
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 5.0}],
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["received_point_count"] == 1
+        assert body["interval_count"] == 0 and body["rate_per_second"] is None
+        assert body["epochs"] == [] and body["intervals"] == []
+        # 幂等重放整批：new=0，dup=全部
+        r = client.post(f"{base}/meter-c/readings", json={
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 5.0}],
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["new_point_count"] == 0 and body["duplicate_point_count"] == 1
+        assert body["received_point_count"] == 1
+
+    print("✓ 计数器归档 API：分批乱序 / 重叠合并、幂等与异值 409、参数固定 / 不一致 409、"
+          "受影响区间与 epoch 重算、查询与 404、非法点 422 全部正确")
+
+
 def test_segment_status_workflow(tmp_db: str = "/tmp/tsad_smoke_workflow.db") -> None:
     """异常段处置工作流：单向状态机、幂等重放、409/404/422、详情与列表计数回显。"""
     import os
@@ -2076,5 +2253,6 @@ if __name__ == "__main__":
     test_counter_rates_no_max_counter_and_zero_delta()
     test_counter_rates_gap_boundary_and_all_unknown()
     test_api_end_to_end()
+    test_counter_series_archive_api()
     test_segment_status_workflow()
     print("\n全部冒烟测试通过 ✅")

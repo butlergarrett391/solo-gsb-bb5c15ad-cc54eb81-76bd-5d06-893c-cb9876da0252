@@ -770,7 +770,7 @@ class CounterRatesResponse(BaseModel):
     interval_count: int = Field(description="区间总数（= point_count − 1）")
     max_counter: float | None = Field(description="回显满量程；未提供时为 null")
     wrap_tolerance: float = Field(description="回显回卷容差")
-    max_gap_seconds: float | None = Field(description="回显断档上限；未提供时为 null")
+    max_gap_seconds: float | None = Field(description="回显断档上限；未提供时 null")
     normal_count: int = Field(description="reason=normal 的区间数")
     wrap_count: int = Field(description="reason=wrap 的区间数")
     reset_count: int = Field(description="reason=reset 的区间数")
@@ -788,6 +788,80 @@ class CounterRatesResponse(BaseModel):
     intervals: list[CounterRateInterval] = Field(description="按时间升序的逐区间结果")
     epochs: list[CounterRateEpoch] = Field(
         description="连续 epoch 列表（按时间升序）；全部区间均为重置 / unknown 时为空列表"
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class CounterReadingsUpsertRequest(BaseModel):
+    """计数器读数分批归档请求（按 series_id 合并入库）。
+
+    首批可携带回卷 / 断档参数，参数在序列创建时固定；后续批次省略的参数
+    沿用首批取值，显式提交但与已存参数不一致时返回 409。
+    """
+
+    points: list[PointIn] = Field(
+        min_length=1,
+        max_length=10_000,
+        description=(
+            "本批累计读数（1~10000 个），允许乱序或与历史区间重叠；"
+            "服务端在事务内按时间戳合并去重，重复时间戳同值幂等、异值返回 409"
+        ),
+    )
+    max_counter: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "计数器满量程（≥0 且有限）：首批提交后固定；后续批次省略时沿用已存值，"
+            "显式提交不一致值返回 409"
+        ),
+    )
+    wrap_tolerance: FiniteFloat = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "回卷容差（≥0 且有限），语义同无状态接口；首批提交后固定，"
+            "后续批次省略时沿用已存值，显式提交不一致值返回 409；不可大于 max_counter"
+        ),
+    )
+    max_gap_seconds: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "断档上限（秒，≥0 且有限，含等号）：首批提交后固定；后续批次省略时"
+            "沿用已存值，显式提交不一致值返回 409"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_wrap_params(self) -> "CounterReadingsUpsertRequest":
+        if self.max_counter is not None and self.wrap_tolerance > self.max_counter:
+            raise ValueError(
+                f"wrap_tolerance 不能大于 max_counter"
+                f"（wrap_tolerance={self.wrap_tolerance} > max_counter={self.max_counter}）"
+            )
+        return self
+
+
+class CounterSeriesResponse(CounterRatesResponse):
+    """已归档计数器序列的最新计算结果。"""
+
+    received_point_count: int = Field(
+        description="服务端已接收（已归档）的去重读数总点数"
+    )
+    created_at: str = Field(description="序列首批读数的归档时间（UTC ISO-8601）")
+    updated_at: str = Field(description="序列最近一次成功合并的时间（UTC ISO-8601）")
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class CounterReadingsUpsertResponse(CounterSeriesResponse):
+    """计数器读数分批提交（合并 + 重算）的响应。"""
+
+    submitted_point_count: int = Field(description="本批请求提交的原始点数（含批内重复）")
+    new_point_count: int = Field(description="本批新合并入库的点数")
+    duplicate_point_count: int = Field(
+        description="本批中幂等重复的点数（批内重复 + 与已存读数同时间戳同值）"
     )
 
     model_config = ConfigDict(extra="ignore")

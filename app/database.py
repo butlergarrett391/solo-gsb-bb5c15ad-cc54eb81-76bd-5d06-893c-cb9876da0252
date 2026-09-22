@@ -38,7 +38,36 @@ CREATE TABLE IF NOT EXISTS segment_statuses (
 );
 CREATE INDEX IF NOT EXISTS idx_segment_statuses_detection
     ON segment_statuses(detection_id);
+
+CREATE TABLE IF NOT EXISTS counter_series (
+    series_id      TEXT PRIMARY KEY,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    max_counter         REAL,
+    wrap_tolerance      REAL NOT NULL,
+    max_gap_seconds     REAL,
+    received_point_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS counter_readings (
+    series_id  TEXT NOT NULL,
+    ts_us      INTEGER NOT NULL,
+    timestamp  TEXT NOT NULL,
+    value      REAL NOT NULL,
+    PRIMARY KEY (series_id, ts_us),
+    FOREIGN KEY (series_id) REFERENCES counter_series(series_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_counter_readings_series_time
+    ON counter_readings(series_id, ts_us);
 """
+
+
+class CounterSeriesParameterConflict(Exception):
+    """后续批次显式提交的回卷 / 断档参数与序列创建时不一致（409）。"""
+
+
+class CounterReadingConflict(Exception):
+    """同一时间戳已存在不同读数（或同批内同时间戳出现异值）（409）。"""
 
 
 def _backfill_segment_statuses(conn: sqlite3.Connection) -> None:
@@ -305,3 +334,252 @@ def list_detections(
             item["id"], {"open": 0, "acknowledged": 0, "resolved": 0}
         )
     return items, total
+
+
+def _compute_counter_rates(
+    readings: list[sqlite3.Row],
+    *,
+    max_counter: float | None,
+    wrap_tolerance: float,
+    max_gap_seconds: float | None,
+    series_id: str,
+) -> dict[str, Any]:
+    """把已归档读数行交给无状态速率核心重算（延迟导入避免循环依赖）。"""
+    from .counter_rates import compute_counter_rates
+
+    timestamps = [row["timestamp"] for row in readings]
+    values = [row["value"] for row in readings]
+    return compute_counter_rates(
+        timestamps,
+        values,
+        max_counter=max_counter,
+        wrap_tolerance=wrap_tolerance,
+        max_gap_seconds=max_gap_seconds,
+        series_id=series_id,
+    )
+
+
+def upsert_counter_readings(
+    series_id: str,
+    parsed_points: list[tuple[int, str, float]],
+    *,
+    max_counter: float | None,
+    wrap_tolerance: float,
+    max_gap_seconds: float | None,
+    explicit_params: set[str],
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """在单个 SQLite 事务内分批合并计数器读数，提交后对全序列重算速率。
+
+    ``parsed_points`` 为已解析的 ``(ts_us, canonical_timestamp, value)`` 列表。
+    读-判-写全程在 ``BEGIN IMMEDIATE`` 事务中：任何冲突（参数不一致、批内异值、
+    与已存同时间戳异值）都整体回滚并抛对应异常，不做部分写入。
+
+    回卷 / 断档参数在首批创建序列时固定；后续批次中省略（不在
+    ``explicit_params`` 内）的参数沿用已存值，显式提交但不一致抛
+    :class:`CounterSeriesParameterConflict`。
+
+    返回 ``{"rates": 最新全量速率结果, "submitted_point_count",
+    "new_point_count", "duplicate_point_count", "received_point_count",
+    "created_at", "updated_at"}``。
+    """
+    # 批内先按时间戳合并：同值记为幂等重复，异值直接冲突（不进入事务）
+    batch_by_ts: dict[int, tuple[str, float]] = {}
+    batch_duplicate = 0
+    for ts_us, iso, value in parsed_points:
+        existing = batch_by_ts.get(ts_us)
+        if existing is None:
+            batch_by_ts[ts_us] = (iso, value)
+        elif existing[1] == value:
+            batch_duplicate += 1
+        else:
+            raise CounterReadingConflict(
+                f"本批在时间戳 {iso} 提交了两个不同读数: {existing[1]:g} 与 {value:g}"
+            )
+
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=15, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM counter_series WHERE series_id = ?", (series_id,)
+            ).fetchone()
+
+            if row is None:
+                eff_max_counter = max_counter
+                eff_wrap_tolerance = wrap_tolerance
+                eff_max_gap = max_gap_seconds
+                created_at = datetime.now(timezone.utc).isoformat()
+            else:
+                eff_max_counter = row["max_counter"]
+                eff_wrap_tolerance = row["wrap_tolerance"]
+                eff_max_gap = row["max_gap_seconds"]
+                created_at = row["created_at"]
+                mismatches: list[str] = []
+                if (
+                    "max_counter" in explicit_params
+                    and max_counter != eff_max_counter
+                ):
+                    mismatches.append(
+                        f"max_counter: 提交 {max_counter!r}，已存 {eff_max_counter!r}"
+                    )
+                if (
+                    "wrap_tolerance" in explicit_params
+                    and wrap_tolerance != eff_wrap_tolerance
+                ):
+                    mismatches.append(
+                        f"wrap_tolerance: 提交 {wrap_tolerance:g}，"
+                        f"已存 {eff_wrap_tolerance:g}"
+                    )
+                if (
+                    "max_gap_seconds" in explicit_params
+                    and max_gap_seconds != eff_max_gap
+                ):
+                    mismatches.append(
+                        f"max_gap_seconds: 提交 {max_gap_seconds!r}，"
+                        f"已存 {eff_max_gap!r}"
+                    )
+                if mismatches:
+                    raise CounterSeriesParameterConflict(
+                        "回卷 / 断档参数与序列创建时不一致（参数在首批提交后固定，"
+                        "省略则沿用已存值）：" + "；".join(mismatches)
+                    )
+
+            # 与已存读数逐个比对：同时间戳同值幂等、异值冲突
+            new_rows: list[tuple[str, int, str, float]] = []
+            existing_duplicate = 0
+            if row is not None:
+                placeholders = ",".join("?" for _ in batch_by_ts)
+                old_rows = conn.execute(
+                    f"""
+                    SELECT ts_us, value FROM counter_readings
+                    WHERE series_id = ? AND ts_us IN ({placeholders})
+                    """,
+                    (series_id, *batch_by_ts.keys()),
+                ).fetchall()
+                old_values = {r["ts_us"]: r["value"] for r in old_rows}
+            else:
+                old_values = {}
+            for ts_us, (iso, value) in batch_by_ts.items():
+                old_value = old_values.get(ts_us)
+                if old_value is None:
+                    new_rows.append((series_id, ts_us, iso, value))
+                elif old_value == value:
+                    existing_duplicate += 1
+                else:
+                    raise CounterReadingConflict(
+                        f"时间戳 {iso} 已归档读数 {old_value:g}，"
+                        f"本次提交 {value:g}，同时间戳不允许异值"
+                    )
+
+            updated_at = datetime.now(timezone.utc).isoformat()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO counter_series (
+                        series_id, created_at, updated_at, max_counter,
+                        wrap_tolerance, max_gap_seconds, received_point_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        series_id,
+                        created_at,
+                        updated_at,
+                        eff_max_counter,
+                        eff_wrap_tolerance,
+                        eff_max_gap,
+                        len(batch_by_ts),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE counter_series
+                    SET updated_at = ?, received_point_count = ?
+                    WHERE series_id = ?
+                    """,
+                    (
+                        updated_at,
+                        row["received_point_count"] + len(new_rows),
+                        series_id,
+                    ),
+                )
+            conn.executemany(
+                """
+                INSERT INTO counter_readings (series_id, ts_us, timestamp, value)
+                VALUES (?, ?, ?, ?)
+                """,
+                new_rows,
+            )
+
+            readings = conn.execute(
+                """
+                SELECT timestamp, value FROM counter_readings
+                WHERE series_id = ? ORDER BY ts_us
+                """,
+                (series_id,),
+            ).fetchall()
+            rates = _compute_counter_rates(
+                readings,
+                max_counter=eff_max_counter,
+                wrap_tolerance=eff_wrap_tolerance,
+                max_gap_seconds=eff_max_gap,
+                series_id=series_id,
+            )
+            received = len(readings)
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {
+        "rates": rates,
+        "submitted_point_count": len(parsed_points),
+        "new_point_count": len(new_rows),
+        "duplicate_point_count": batch_duplicate + existing_duplicate,
+        "received_point_count": received,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def get_counter_series(
+    series_id: str, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """读取已归档计数器序列：元数据 + 全部读数按时间升序重算的最新结果。
+
+    序列不存在时返回 ``None``。
+    """
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM counter_series WHERE series_id = ?", (series_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        readings = conn.execute(
+            """
+            SELECT timestamp, value FROM counter_readings
+            WHERE series_id = ? ORDER BY ts_us
+            """,
+            (series_id,),
+        ).fetchall()
+
+    rates = _compute_counter_rates(
+        readings,
+        max_counter=row["max_counter"],
+        wrap_tolerance=row["wrap_tolerance"],
+        max_gap_seconds=row["max_gap_seconds"],
+        series_id=series_id,
+    )
+    return {
+        "rates": rates,
+        "received_point_count": row["received_point_count"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }

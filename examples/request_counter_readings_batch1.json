@@ -1,0 +1,10 @@
+{
+  "max_counter": 1000,
+  "wrap_tolerance": 5,
+  "max_gap_seconds": 300,
+  "points": [
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 100.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 110.0}
+  ]
+}
