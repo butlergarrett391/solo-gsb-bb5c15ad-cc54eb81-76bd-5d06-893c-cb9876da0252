@@ -2042,6 +2042,219 @@ def test_segment_status_workflow(tmp_db: str = "/tmp/tsad_smoke_workflow.db") ->
     print("✓ 异常段处置工作流：状态机 / 幂等 / 409 / 404 / 422 / 计数回显全部正确")
 
 
+def test_counter_series_archive(tmp_db: str = "/tmp/tsad_smoke_counter_archive.db") -> None:
+    """计数器归档：分批乱序/重叠提交、事务合并、幂等与 409、参数一致性与重算查询。"""
+    import json as _json
+    import os
+
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    os.environ["DB_PATH"] = tmp_db
+    from app import database
+
+    database.DB_PATH = tmp_db
+    database.init_db(tmp_db)
+
+    with TestClient(app) as client:
+        base_params = {"max_counter": 1000, "wrap_tolerance": 5, "max_gap_seconds": 300}
+        url = "/api/v1/counter-series/water-meter-archive/points"
+
+        # 未知序列查询 → 404
+        r = client.get("/api/v1/counter-series/water-meter-archive")
+        assert r.status_code == 404 and "不存在" in r.text
+
+        # 第一批：乱序 4 点（缺 00:03），998 -> 20 负增量不贴边界 → reset
+        batch1 = {
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T00:02:00Z", "value": 998.0},
+                {"timestamp": "2026-09-22T00:00:00Z", "value": 100.0},
+                {"timestamp": "2026-09-22T00:04:00Z", "value": 20.0},
+                {"timestamp": "2026-09-22T00:01:00Z", "value": 110.0},
+            ],
+        }
+        r = client.post(url, json=batch1)
+        assert r.status_code == 200, r.text
+        b1 = r.json()
+        assert b1["created"] is True
+        assert (b1["accepted_count"], b1["duplicate_count"]) == (4, 0)
+        assert b1["point_count"] == 4 and b1["interval_count"] == 3
+        assert (b1["normal_count"], b1["reset_count"], b1["epoch_count"]) == (2, 1, 1)
+        assert b1["created_at"] == b1["updated_at"]
+        assert (b1["max_counter"], b1["wrap_tolerance"], b1["max_gap_seconds"]) == (
+            1000.0, 5.0, 300.0,
+        )
+
+        # 第二批：与第一批重叠（00:04 同值幂等）+ 补 00:03=5（回卷）+ 新点 00:05
+        batch2 = {
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T00:04:00Z", "value": 20.0},
+                {"timestamp": "2026-09-22T00:03:00Z", "value": 5.0},
+                {"timestamp": "2026-09-22T00:05:00Z", "value": 35.0},
+            ],
+        }
+        r = client.post(url, json=batch2)
+        assert r.status_code == 200, r.text
+        b2 = r.json()
+        assert b2["created"] is False
+        assert (b2["accepted_count"], b2["duplicate_count"]) == (2, 1)
+        assert b2["point_count"] == 6 and b2["interval_count"] == 5
+        # 插入 00:03=5 后受影响区间被重算：998->5 回卷（+7）、5->20 normal，reset 消失
+        assert (b2["wrap_count"], b2["reset_count"], b2["epoch_count"]) == (1, 0, 1)
+        assert b2["total_delta"] == 10 + 888 + 7 + 15 + 15
+        assert b2["updated_at"] >= b1["updated_at"]
+
+        # 查询：与无状态接口对同一合并序列的计算结果一致
+        r = client.get("/api/v1/counter-series/water-meter-archive")
+        assert r.status_code == 200, r.text
+        state = r.json()
+        assert state["series_id"] == "water-meter-archive"
+        assert state["point_count"] == 6
+        assert [iv["reason"] for iv in state["intervals"]] == [
+            "normal", "normal", "wrap", "normal", "normal",
+        ]
+        assert state["epoch_count"] == 1 and state["epochs"][0]["total_delta"] == 935.0
+        merged_payload = {
+            **base_params,
+            "points": [
+                {"timestamp": f"2026-09-22T00:0{i}:00Z", "value": v}
+                for i, v in enumerate([100.0, 110.0, 998.0, 5.0, 20.0, 35.0])
+            ],
+        }
+        r = client.post("/api/v1/counter-rates", json=merged_payload)
+        stateless = r.json()
+        for key in ("total_delta", "rate_per_second", "epoch_count", "interval_count"):
+            assert state[key] == stateless[key], key
+        assert [iv["delta"] for iv in state["intervals"]] == [
+            iv["delta"] for iv in stateless["intervals"]
+        ]
+
+        # 全幂等重放：计数不变、updated_at 不刷新
+        r = client.post(url, json=batch2)
+        assert r.status_code == 200
+        b3 = r.json()
+        assert (b3["accepted_count"], b3["duplicate_count"]) == (0, 3)
+        assert b3["point_count"] == 6 and b3["updated_at"] == b2["updated_at"]
+
+        # 批次内同值重复：幂等去重（1 新 + 1 重复）
+        r = client.post(url, json={
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T00:06:00Z", "value": 50.0},
+                {"timestamp": "2026-09-22T00:06:00Z", "value": 50.0},
+            ],
+        })
+        assert r.status_code == 200
+        b4 = r.json()
+        assert (b4["accepted_count"], b4["duplicate_count"]) == (1, 1)
+        assert b4["point_count"] == 7
+
+        # 异值冲突（与已归档点同时间戳）：409 且整批回滚（00:07 不得写入）
+        r = client.post(url, json={
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T00:07:00Z", "value": 60.0},
+                {"timestamp": "2026-09-22T00:06:00Z", "value": 999.0},
+            ],
+        })
+        assert r.status_code == 409, r.text
+        assert "00:06:00" in r.text and "已归档=50" in r.text
+        r = client.get("/api/v1/counter-series/water-meter-archive")
+        assert r.json()["point_count"] == 7
+
+        # 批次内异值重复：409
+        r = client.post(url, json={
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T00:08:00Z", "value": 1.0},
+                {"timestamp": "2026-09-22T00:08:00Z", "value": 2.0},
+            ],
+        })
+        assert r.status_code == 409
+
+        # 参数不一致：改动任一参数（含把 max_counter 改为 null）均 409
+        for override in (
+            {"max_counter": 2000},
+            {"wrap_tolerance": 6},
+            {"max_gap_seconds": 600},
+            {"max_counter": None},
+        ):
+            r = client.post(url, json={
+                **base_params,
+                **override,
+                "points": [{"timestamp": "2026-09-22T00:09:00Z", "value": 1.0}],
+            })
+            assert r.status_code == 409, (override, r.text)
+        # 省略已设置的可选参数同样视为不一致
+        r = client.post(url, json={
+            "wrap_tolerance": 5,
+            "max_gap_seconds": 300,
+            "points": [{"timestamp": "2026-09-22T00:09:00Z", "value": 1.0}],
+        })
+        assert r.status_code == 409
+
+        # 断档参数沿用首次提交：补两个远点，跨度 6540s > 300s 的区间标 unknown
+        # 并切断 epoch，其后的 normal 区间组成第二个 epoch
+        r = client.post(url, json={
+            **base_params,
+            "points": [
+                {"timestamp": "2026-09-22T02:00:00Z", "value": 70.0},
+                {"timestamp": "2026-09-22T02:01:00Z", "value": 80.0},
+            ],
+        })
+        assert r.status_code == 200
+        b5 = r.json()
+        assert (b5["accepted_count"], b5["point_count"]) == (2, 9)
+        assert (b5["unknown_count"], b5["epoch_count"]) == (1, 2)
+        r = client.get("/api/v1/counter-series/water-meter-archive")
+        state = r.json()
+        assert [iv["reason"] for iv in state["intervals"]][-2:] == ["unknown", "normal"]
+        assert state["intervals"][-2]["delta"] is None
+        assert state["epochs"][1]["total_delta"] == 10.0
+
+        # 非法点：空批次 / 非有限值 / 无法解析时间戳 / wrap_tolerance > max_counter → 422
+        r = client.post(url, json={**base_params, "points": []})
+        assert r.status_code == 422
+        r = client.post(
+            url,
+            content=_json.dumps({
+                **base_params,
+                "points": [{"timestamp": "2026-09-22T03:00:00Z", "value": float("nan")}],
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422
+        r = client.post(url, json={
+            **base_params,
+            "points": [{"timestamp": "not-a-time", "value": 1.0}],
+        })
+        assert r.status_code == 422
+        r = client.post("/api/v1/counter-series/other-series/points", json={
+            "max_counter": 10,
+            "wrap_tolerance": 11,
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 1.0}],
+        })
+        assert r.status_code == 422
+
+        # 新序列省略可选参数：以 null 持久化，后续带参数提交 → 409
+        r = client.post("/api/v1/counter-series/minimal-series/points", json={
+            "points": [{"timestamp": "2026-09-22T00:00:00Z", "value": 1.0}],
+        })
+        assert r.status_code == 200, r.text
+        mb = r.json()
+        assert mb["max_counter"] is None and mb["max_gap_seconds"] is None
+        assert mb["point_count"] == 1 and mb["interval_count"] == 0
+        assert mb["epoch_count"] == 0 and mb["rate_per_second"] is None
+        r = client.post("/api/v1/counter-series/minimal-series/points", json={
+            "max_counter": 1000,
+            "points": [{"timestamp": "2026-09-22T00:01:00Z", "value": 2.0}],
+        })
+        assert r.status_code == 409
+
+    print("✓ 计数器归档：分批乱序合并 / 幂等与 409 / 参数一致性 / 重算与查询全部正确")
+
+
 if __name__ == "__main__":
     test_algorithm_spikes_and_shift()
     test_constant_baseline()
@@ -2077,4 +2290,5 @@ if __name__ == "__main__":
     test_counter_rates_gap_boundary_and_all_unknown()
     test_api_end_to_end()
     test_segment_status_workflow()
+    test_counter_series_archive()
     print("\n全部冒烟测试通过 ✅")

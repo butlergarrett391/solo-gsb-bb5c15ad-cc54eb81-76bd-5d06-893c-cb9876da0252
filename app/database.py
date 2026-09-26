@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS segment_statuses (
 );
 CREATE INDEX IF NOT EXISTS idx_segment_statuses_detection
     ON segment_statuses(detection_id);
+
+CREATE TABLE IF NOT EXISTS counter_series (
+    series_id       TEXT PRIMARY KEY,
+    max_counter     REAL,
+    wrap_tolerance  REAL NOT NULL,
+    max_gap_seconds REAL,
+    point_count     INTEGER NOT NULL DEFAULT 0,
+    result_json     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS counter_points (
+    series_id TEXT NOT NULL,
+    ts_us     INTEGER NOT NULL,
+    value     REAL NOT NULL,
+    PRIMARY KEY (series_id, ts_us)
+);
 """
 
 
@@ -305,3 +323,205 @@ def list_detections(
             item["id"], {"open": 0, "acknowledged": 0, "resolved": 0}
         )
     return items, total
+
+
+class CounterSeriesParamMismatch(Exception):
+    """归档序列已存在，且本次提交的回卷/断档参数与首次提交不一致（409）。"""
+
+
+class CounterPointConflict(Exception):
+    """提交批次中存在与已归档读数同时间戳异值的点（409，整批回滚）。"""
+
+
+def ingest_counter_points(
+    series_id: str,
+    points: list[tuple[int, float]],
+    *,
+    max_counter: float | None,
+    wrap_tolerance: float,
+    max_gap_seconds: float | None,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """把一批 ``(ts_us, value)`` 读数合并进归档序列并重算（读-判-写同一事务）。
+
+    - 序列不存在时以本次提交的回卷/断档参数创建；已存在时提交参数必须与
+      首次完全一致，否则抛 :class:`CounterSeriesParamMismatch`（不写入）；
+    - 同时间戳同值（含批次内重复与已归档点）为幂等重复，计入
+      ``duplicate_count``；同时间戳异值抛 :class:`CounterPointConflict`，
+      整批回滚、不写入任何点；
+    - 有新点接收时，对合并后的完整序列沿用持久化参数全量重算区间与 epoch
+      （插入点两侧的受影响区间随之更新），结果写入 ``counter_series.result_json``；
+      全部点均为幂等重复时不重算、不刷新 ``updated_at``（幂等重放无副作用）。
+    """
+    from .counter_rates import compute_counter_rates
+    from .resampling import format_epoch_microseconds
+
+    if not points:
+        raise ValueError("points 不能为空")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=15, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM counter_series WHERE series_id = ?", (series_id,)
+            ).fetchone()
+            created = row is None
+            if created:
+                created_at = now
+                stored_params = (max_counter, wrap_tolerance, max_gap_seconds)
+            else:
+                created_at = row["created_at"]
+                stored_params = (
+                    row["max_counter"],
+                    row["wrap_tolerance"],
+                    row["max_gap_seconds"],
+                )
+                submitted = (max_counter, wrap_tolerance, max_gap_seconds)
+                if stored_params != submitted:
+                    names = ("max_counter", "wrap_tolerance", "max_gap_seconds")
+                    detail = "；".join(
+                        f"{name}: 已归档={stored} 本次提交={sub}"
+                        for name, stored, sub in zip(names, stored_params, submitted)
+                        if stored != sub
+                    )
+                    raise CounterSeriesParamMismatch(
+                        f"计数器序列 {series_id} 已存在，回卷/断档参数与首次提交不一致"
+                        f"（{detail}）；归档序列的参数以首次提交为准"
+                    )
+
+            rows = conn.execute(
+                """
+                SELECT ts_us, value FROM counter_points
+                WHERE series_id = ? ORDER BY ts_us
+                """,
+                (series_id,),
+            ).fetchall()
+            merged: dict[int, float] = {r["ts_us"]: r["value"] for r in rows}
+
+            conflicts: list[tuple[int, float, float]] = []
+            to_insert: list[tuple[str, int, float]] = []
+            accepted = 0
+            duplicates = 0
+            for ts_us, value in points:
+                if ts_us in merged:
+                    if merged[ts_us] == value:
+                        duplicates += 1
+                    else:
+                        conflicts.append((ts_us, merged[ts_us], value))
+                    continue
+                merged[ts_us] = value
+                to_insert.append((series_id, ts_us, value))
+                accepted += 1
+
+            if conflicts:
+                shown = "；".join(
+                    f"{format_epoch_microseconds(ts)}: 已归档={old:g} 本次提交={new:g}"
+                    for ts, old, new in conflicts[:10]
+                )
+                suffix = f" 等 {len(conflicts)} 处" if len(conflicts) > 10 else ""
+                raise CounterPointConflict(
+                    f"计数器序列 {series_id} 存在同时间戳异值读数{suffix}：{shown}；"
+                    "同值重复为幂等，异值冲突整批回滚"
+                )
+
+            if accepted > 0:
+                conn.executemany(
+                    "INSERT INTO counter_points (series_id, ts_us, value) VALUES (?, ?, ?)",
+                    to_insert,
+                )
+                ordered = sorted(merged.items())
+                eff_max_counter, eff_wrap_tolerance, eff_max_gap = stored_params
+                result = compute_counter_rates(
+                    [format_epoch_microseconds(ts) for ts, _ in ordered],
+                    [v for _, v in ordered],
+                    max_counter=eff_max_counter,
+                    wrap_tolerance=eff_wrap_tolerance,
+                    max_gap_seconds=eff_max_gap,
+                    series_id=series_id,
+                )
+                result_json = json.dumps(result, ensure_ascii=False)
+                if created:
+                    conn.execute(
+                        """
+                        INSERT INTO counter_series (
+                            series_id, max_counter, wrap_tolerance, max_gap_seconds,
+                            point_count, result_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            series_id,
+                            max_counter,
+                            wrap_tolerance,
+                            max_gap_seconds,
+                            result["point_count"],
+                            result_json,
+                            created_at,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE counter_series
+                        SET point_count = ?, result_json = ?, updated_at = ?
+                        WHERE series_id = ?
+                        """,
+                        (result["point_count"], result_json, now, series_id),
+                    )
+                updated_at = now
+            else:
+                # 全部幂等重复：直接回读已存结果，不刷新 updated_at
+                result = json.loads(row["result_json"])
+                updated_at = row["updated_at"]
+
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {
+        "series_id": series_id,
+        "created": created,
+        "accepted_count": accepted,
+        "duplicate_count": duplicates,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "point_count": result["point_count"],
+        "interval_count": result["interval_count"],
+        "max_counter": result["max_counter"],
+        "wrap_tolerance": result["wrap_tolerance"],
+        "max_gap_seconds": result["max_gap_seconds"],
+        "normal_count": result["normal_count"],
+        "wrap_count": result["wrap_count"],
+        "reset_count": result["reset_count"],
+        "unknown_count": result["unknown_count"],
+        "epoch_count": result["epoch_count"],
+        "total_delta": result["total_delta"],
+        "total_duration_seconds": result["total_duration_seconds"],
+        "rate_per_second": result["rate_per_second"],
+    }
+
+
+def get_counter_series(
+    series_id: str, db_path: str | None = None
+) -> dict[str, Any] | None:
+    """按 series_id 读取归档序列的最新计算结果；不存在返回 None。"""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM counter_series WHERE series_id = ?", (series_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "series_id": row["series_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "result": json.loads(row["result_json"]),
+    }

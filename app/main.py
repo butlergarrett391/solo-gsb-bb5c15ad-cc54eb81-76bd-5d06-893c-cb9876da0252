@@ -5,9 +5,9 @@ from __future__ import annotations
 import math
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -21,6 +21,9 @@ from .lag_correlation import scan_lag_correlation
 from .models import (
     CounterRatesRequest,
     CounterRatesResponse,
+    CounterSeriesIngestRequest,
+    CounterSeriesIngestResponse,
+    CounterSeriesStateResponse,
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
@@ -66,8 +69,12 @@ app = FastAPI(
         "正常非负增量直接计入；负增量在前值距 max_counter、后值距 0 均不超过 "
         "wrap_tolerance 时按回卷计算，否则标注重置边界；时间跨度超过 max_gap_seconds "
         "的区间标 unknown；重置与 unknown 均切断连续 epoch，汇总值只统计已知增量。"
+        "计数器归档接口按 series_id 持久化累计读数：客户端可分批提交乱序或重叠时间点，"
+        "服务端在 SQLite 事务中按时间合并（同时间戳同值幂等、异值 409），"
+        "沿用首次提交的回卷/断档参数重算受影响区间与 epoch，"
+        "并可查询最新计算结果与已接收点数。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -432,6 +439,75 @@ def counter_rates(req: CounterRatesRequest) -> dict:
         max_gap_seconds=req.max_gap_seconds,
         series_id=req.series_id,
     )
+
+
+@app.post(
+    "/api/v1/counter-series/{series_id}/points",
+    response_model=CounterSeriesIngestResponse,
+    tags=["计数器归档"],
+)
+def ingest_counter_series_points(
+    series_id: Annotated[str, Path(max_length=128)],
+    req: CounterSeriesIngestRequest,
+) -> dict:
+    """按 series_id 归档计数器读数：分批提交、乱序 / 重叠时间点事务内合并。
+
+    - 客户端可任意分批提交，批次内与批次间时间点可乱序、可重叠；
+      服务端在单个 SQLite 事务（BEGIN IMMEDIATE）中按时间合并；
+    - 同时间戳**同值**（含批次内重复与已归档点）为幂等重复，计入
+      ``duplicate_count``；同时间戳**异值**整批拒绝（409），不写入任何点；
+    - 首次提交以请求中的 ``max_counter`` / ``wrap_tolerance`` /
+      ``max_gap_seconds`` 创建序列；后续提交参数必须与首次完全一致（含
+      null 语义），否则 409；重算一律沿用首次提交的参数；
+    - 有新点接收时对合并后的完整序列重算区间与 epoch（插入点两侧的
+      受影响区间随之更新）；全部点均为幂等重复时不重算、不刷新
+      ``updated_at``；
+    - 非法点（空批次、超过 10000 点、非有限数值、无法解析的时间戳、
+      参数校验失败）返回 422；序列不存在不是错误（首次提交即创建）。
+    """
+    parsed: list[tuple[int, float]] = []
+    for p in req.points:
+        try:
+            dt = parse_timestamp(p.timestamp)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        parsed.append((epoch_microseconds(dt), p.value))
+
+    try:
+        return database.ingest_counter_points(
+            series_id,
+            parsed,
+            max_counter=req.max_counter,
+            wrap_tolerance=req.wrap_tolerance,
+            max_gap_seconds=req.max_gap_seconds,
+        )
+    except database.CounterSeriesParamMismatch as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except database.CounterPointConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get(
+    "/api/v1/counter-series/{series_id}",
+    response_model=CounterSeriesStateResponse,
+    tags=["计数器归档"],
+)
+def get_counter_series_state(
+    series_id: Annotated[str, Path(max_length=128)],
+) -> dict:
+    """查询归档序列的最新计算结果（逐区间 / epoch / 汇总）与已接收点数。
+
+    序列不存在返回 404；响应结构与无状态计数器速率接口一致，
+    另附 ``created_at`` / ``updated_at``；``point_count`` 即已接收点数。
+    """
+    record = database.get_counter_series(series_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"计数器序列不存在: {series_id}")
+    return {
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+        **record["result"],
+    }
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

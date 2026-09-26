@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合、无状态等间隔重采样与无状态累计计数器速率计算服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合、无状态等间隔重采样、累计计数器速率计算与按 series_id 的计数器读数归档服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。每个已保存检测的异常段都可走**处置工作流**：`open → acknowledged → resolved` 单向流转（可附备注），检测详情与列表摘要回显各状态计数。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。计数器速率接口对带时间戳的**累计读数**逐相邻区间计算增量与每秒速率：正常非负增量直接计入；负增量在**前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance`** 时按计数器**回卷**（rollover）计算，否则标为**重置边界**；时间跨度超过 `max_gap_seconds` 的区间标 **unknown**；重置与 unknown 都切断连续 **epoch**，逐区间返回增量 / 速率 / 判定原因与各 epoch 累计，汇总值排除重置与 unknown（无状态，不入库）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。每个已保存检测的异常段都可走**处置工作流**：`open → acknowledged → resolved` 单向流转（可附备注），检测详情与列表摘要回显各状态计数。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。计数器速率接口对带时间戳的**累计读数**逐相邻区间计算增量与每秒速率：正常非负增量直接计入；负增量在**前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance`** 时按计数器**回卷**（rollover）计算，否则标为**重置边界**；时间跨度超过 `max_gap_seconds` 的区间标 **unknown**；重置与 unknown 都切断连续 **epoch**，逐区间返回增量 / 速率 / 判定原因与各 epoch 累计，汇总值排除重置与 unknown（无状态，不入库）。计数器归档接口按 **series_id 持久化**累计读数：客户端可**分批提交乱序或重叠时间点**，服务端在 **SQLite 事务**中按时间合并——同时间戳**同值幂等**、**异值返回 409**（整批回滚）——并**沿用首次提交的回卷/断档参数**重算受影响区间与 epoch；查询接口返回最新计算结果与已接收点数，未知序列、参数不一致与非法点分别返回 404 / 409 / 422。
 
 ## 特性
 
@@ -18,6 +18,7 @@
 - **跨检测事件聚合**：`POST /api/v1/incidents/aggregate` 接收 1~50 个已保存的 `detection_id` 与非负 `gap_seconds`，把各检测的异常段统一按时间排序后顺序扫描——下一段开始时间不晚于当前事件结束时间 `+ gap_seconds`（即**时间重叠、首尾相接或间隔不超过 gap**）即并入同一事件，因此**同一检测的相邻异常段**同样会被合并，邻近关系可链式传递。每个事件返回起止时间、覆盖的 `series_id` / `detection_id`、成员段数、成员中的最大绝对 z 分数，以及按 `(start_time, detection_id, segment_index)` 稳定排序、可回溯到来源段的成员定位。接口只读，不写入或修改任何检测记录。
 - **无状态等间隔重采样**：`POST /api/v1/resample` 在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格，网格时刻 `anchor + k·interval` 全部按**整数微秒**整数运算生成（无浮点累加漂移，最多 10000 点）。原始样本恰落某网格点时标 `observed` 直取样本值；其余点仅当其前后两个样本的间隔 **≤ `max_gap_seconds`** 时补值——`linear` 按实际时间差线性插值、`previous` 取前一样本（前向填充），统一标 `interpolated`；前后样本间隔超限则 `value=null`、`source=missing`，**不跨断档补值，也不向首末样本之外外推**。响应返回三类点计数（`observed_count` / `interpolated_count` / `missing_count`）与逐点结果，并把连续出现的 missing 点汇总为**连续缺口范围** `missing_ranges`（起止网格点、点数、包围样本及其实测间隔）。
 - **无状态累计计数器速率**：`POST /api/v1/counter-rates` 对带时间戳的累计读数逐相邻区间计算增量与**每秒速率**。后值 ≥ 前值时增量 = 后值 − 前值（`normal`）；出现负增量且**前值距 `max_counter`、后值距 0 均不超过 `wrap_tolerance`** 时按计数器**回卷**计算，增量 = `(max_counter − 前值) + 后值`（`wrap`）；其余负增量（或未提供 `max_counter`）标为**重置边界**（`reset`，增量 / 速率为 `null`）。相邻读数时间跨度超过 `max_gap_seconds`（`>`，等号不算超限）时该区间标 `unknown`（增量 / 速率为 `null`，断档判定优先于回卷 / 重置）。连续的 normal / wrap 区间组成一个 **epoch**，重置与 unknown 都会**切断 epoch**；响应逐区间返回起止索引 / 时刻、跨度、前后读数、增量、每秒速率、判定原因代码与中文解释、所属 `epoch_index`，并返回各 epoch 的累计增量 / 时长 / 平均速率。汇总 `total_delta` / `rate_per_second` **只统计 normal / wrap 区间**（排除重置与 unknown），无已知区间时汇总速率为 `null`。
+- **计数器读数归档（按 series_id）**：`POST /api/v1/counter-series/{series_id}/points` 把累计读数按业务 `series_id` **持久化到 SQLite**。客户端可任意**分批**提交，批次内与批次间时间点可**乱序、可重叠**；服务端在单个事务（`BEGIN IMMEDIATE`）中以 `(series_id, epoch 微秒时刻)` 为主键按时间合并：同时间戳**同值幂等**（计入 `duplicate_count`）、**异值返回 409** 并**整批回滚**（连同批次内自相矛盾的点）。首次提交以请求中的 `max_counter` / `wrap_tolerance` / `max_gap_seconds` 创建序列，**后续提交参数必须与首次完全一致**（含 `null` 语义，不一致返回 409）；有新点接收时对合并后的完整序列**沿用首次参数重算**区间与 epoch（插入点两侧的受影响区间随之更新），全幂等提交不重算、不刷新 `updated_at`。`GET /api/v1/counter-series/{series_id}` 返回与无状态接口同构的**最新完整计算结果**及**已接收点数** `point_count`；未知序列返回 404，非法点（空批次、超 10000 点、非有限值、无法解析的时间戳、`wrap_tolerance > max_counter`）返回 422。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **异常段处置工作流**：每个已保存检测的异常段持久化处置状态（`open` / `acknowledged` / `resolved`）、备注 `note` 与更新时间 `updated_at`（新建检测的段默认 `open`）。`POST /api/v1/detections/{id}/segments/{index}/status` 提交目标状态：仅允许 `open → acknowledged → resolved` 单向流转，提交与当前相同的状态为**幂等重放**（返回 200 且状态不变，附非空 `note` 时仅更新备注），越级或回退等非法跳转返回 **409**；检测不存在或段序号越界返回 404。检测详情与列表摘要均回显 `status_counts`（三种状态各自的段数）。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
@@ -46,7 +47,9 @@
 │   ├── request_trends.json         # 趋势扫描示例请求（先升后降，方向切换）
 │   ├── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
 │   ├── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
-│   └── request_counter_rates.json  # 计数器速率示例请求（回卷 + 重置 + 断档 unknown）
+│   ├── request_counter_rates.json  # 计数器速率示例请求（回卷 + 重置 + 断档 unknown）
+│   ├── request_counter_ingest.json       # 计数器归档批次 1（乱序提交）
+│   └── request_counter_ingest_batch2.json # 计数器归档批次 2（重叠幂等 + 新点）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -63,7 +66,7 @@
 docker compose up --build
 ```
 
-服务启动在 <http://localhost:8000>，数据库保存在命名卷 `ts_data` 中。
+服务启动在 <http://localhost:8000>，数据库保存在命名卷 `ts_data` 中（检测记录与计数器归档读数均持久化于此，容器重启不丢失）。
 
 验证：
 
@@ -84,7 +87,19 @@ curl -X POST http://localhost:8000/api/v1/resample \
 curl -X POST http://localhost:8000/api/v1/counter-rates \
   -H "Content-Type: application/json" \
   -d @examples/request_counter_rates.json
+
+# 计数器读数归档：分批提交（两批均可乱序、可重叠），再查询最新计算结果
+SERIES=water-meter-archive
+curl -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_ingest.json
+curl -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_ingest_batch2.json
+curl http://localhost:8000/api/v1/counter-series/$SERIES | python -m json.tool
 ```
+
+> 注：`examples/` 目录不会被打包进镜像（见 `.dockerignore`），上面的 `curl -d @examples/...` 请在宿主机仓库目录执行；也可以用下文「内联 JSON 示例」直接提交。停止服务并清空归档数据：`docker compose down -v`。
 
 ### 方式二：本地 Python 运行
 
@@ -361,6 +376,75 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 }
 ```
 
+### `POST /api/v1/counter-series/{series_id}/points` — 归档计数器读数（分批提交）
+
+把累计读数按业务 **`series_id`**（路径参数，≤128 字符）持久化到 SQLite。与无状态接口不同：读数**不要求一次交齐**，客户端可以任意**分批**提交，批次内与批次间的时间点**可乱序、可重叠**，服务端按时间合并维护单一有序序列。
+
+合并与重算规则（全部在单个 `BEGIN IMMEDIATE` 事务中完成，并发提交不会互相交错）：
+
+1. 序列**不存在**（首次提交）：以请求中的 `max_counter` / `wrap_tolerance` / `max_gap_seconds` 创建序列并持久化参数；序列**已存在**：本次提交的三个参数必须与首次**完全一致**（`null` 与缺省同值，但与显式数值不一致），否则返回 **409**，不写入；
+2. 批次中每个点按 `(series_id, epoch 整数微秒时刻)` 定位：
+   - 时间戳**不存在**：接收为新点（计入 `accepted_count`）；
+   - 时间戳**已存在且值相同**（包括批次内重复、与已归档点重复）：**幂等**，计入 `duplicate_count`；
+   - 时间戳**已存在但值不同**（包括同批次自相矛盾）：收集全部冲突后返回 **409**，错误详情列出冲突时刻 / 已归档值 / 本次提交值（最多 10 处 + 总数），**整批回滚**——批次里的新点也不会写入；
+3. 有新点接收时，对合并后的完整有序序列**沿用首次提交的参数**重算全部区间与 epoch（语义上即插入点两侧的受影响区间被重算，未受影响区间结果不变），结果持久化并刷新 `updated_at`；全部点均为幂等重复时直接回读已存结果，**不重算、不刷新 `updated_at`**（幂等重放无副作用）。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `points` | `[{timestamp, value}]` | 必填（**1~10000**） | 本批累计读数；时间戳格式与检测接口一致，可乱序 / 重叠；`value` 必须为有限数值。归档允许只含 1 个点（逐步累积），此时尚无区间，`interval_count=0` |
+| `max_counter` | float \| null | `null` | 计数器满量程（**≥0** 且有限）；**首次提交时持久化，后续必须一致**（不一致 409） |
+| `wrap_tolerance` | float | `0` | 回卷容差（**≥0** 且有限，`≤ max_counter`）；**首次提交时持久化，后续必须一致** |
+| `max_gap_seconds` | float \| null | `null` | 断档上限（秒，**≥0** 且有限，含等号）；**首次提交时持久化，后续必须一致** |
+
+响应（摘要，不携带逐区间明细）：
+
+- `created`：本次提交是否新建了序列（首次提交为 `true`）；
+- 接收计数：`accepted_count`（本批新点数）、`duplicate_count`（本批幂等重复点数）、`point_count`（**序列累计已接收点数**）、`interval_count`（= `point_count − 1`）；
+- 参数回显：以**首次提交为准**的 `max_counter` / `wrap_tolerance` / `max_gap_seconds`；
+- 重算摘要：`normal_count` / `wrap_count` / `reset_count` / `unknown_count` / `epoch_count`、`total_delta` / `total_duration_seconds` / `rate_per_second`（口径与无状态接口完全一致）；
+- `created_at` / `updated_at`（UTC ISO-8601；`updated_at` 为最近一次实际接收新点的时间）。
+
+错误：参数不一致与异值冲突返回 **409**（事务回滚，库内容不变）；空批次、超过 10000 点、`value` 非有限、时间戳无法解析、`wrap_tolerance > max_counter`、参数非有限 / 越界、`series_id` 超长均返回 **422**。
+
+### `GET /api/v1/counter-series/{series_id}` — 查询归档序列最新结果
+
+返回序列**最新一次重算后的完整结果**，结构与无状态 `POST /api/v1/counter-rates` 响应**同构**（同样的 `point_count` / 区间计数 / 参数回显 / 逐区间 `intervals[]` / `epochs[]` / 汇总字段），并额外携带：
+
+- `point_count`：即**已接收点数**（合并去重后的累计读数数）；
+- `created_at` / `updated_at`：序列创建时间、最近一次实际接收新点的时间（全幂等提交不改变后者）。
+
+序列不存在（从未提交过）返回 **404**（错误详情给出 series_id）。
+
+```json
+{
+  "series_id": "water-meter-archive",
+  "point_count": 6,
+  "interval_count": 5,
+  "max_counter": 1000.0,
+  "wrap_tolerance": 5.0,
+  "max_gap_seconds": 300.0,
+  "normal_count": 4,
+  "wrap_count": 1,
+  "reset_count": 0,
+  "unknown_count": 0,
+  "epoch_count": 1,
+  "total_delta": 935.0,
+  "total_duration_seconds": 300.0,
+  "rate_per_second": 3.1166666666666667,
+  "intervals": ["...5 个逐区间结果（结构同无状态接口）..."],
+  "epochs": [
+    {"epoch_index": 0, "start_index": 0, "end_index": 5,
+     "start_time": "2026-09-22T00:00:00+00:00", "end_time": "2026-09-22T00:05:00+00:00",
+     "point_count": 6, "interval_count": 5, "total_delta": 935.0,
+     "duration_seconds": 300.0, "rate_per_second": 3.1166666666666667}
+  ],
+  "created_at": "2026-09-26T08:00:00.000000+00:00",
+  "updated_at": "2026-09-26T08:00:01.000000+00:00"
+}
+```
+
 ### `GET /health` — 健康检查
 
 ## 调用示例
@@ -614,6 +698,57 @@ curl -s -X POST http://localhost:8000/api/v1/counter-rates \
 - **省略参数的语义**：省略 `max_counter` 时不做回卷判定，任何负增量都是 `reset`；省略 `max_gap_seconds` 时不做断档判定（大跨度也计入）；
 - **汇总口径**：`total_delta` 与 `rate_per_second` 只累加 normal / wrap 区间；全部区间均为 reset / unknown 时 `epochs=[]`、`total_delta=0`、`rate_per_second=null`。
 
+### 计数器读数归档（counter-series，分批提交 / 查询 / 冲突）
+
+```bash
+SERIES=water-meter-archive
+
+# 1) 第一批：乱序 4 点（00:00/00:01/00:02/00:04，缺 00:03）。
+#    首次提交以 max_counter=1000 / wrap_tolerance=5 / max_gap_seconds=300 创建序列。
+curl -s -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_ingest.json | python -m json.tool
+# → created=true, accepted_count=4, duplicate_count=0, point_count=4
+#   此时 998 -> 20 因后值距 0 为 20 > 容差 5 判 reset，epoch_count=1
+
+# 2) 第二批：00:04=20 与已归档点重叠（同值 → 幂等），补 00:03=5（与 998 构成回卷），
+#    再加新点 00:05=35。事务内合并后受影响区间被重算：reset 消失、wrap=+7 出现。
+curl -s -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_ingest_batch2.json | python -m json.tool
+# → created=false, accepted_count=2, duplicate_count=1, point_count=6
+#   wrap_count=1, reset_count=0, epoch_count=1, total_delta=935
+
+# 3) 整批原样重放：全部幂等，updated_at 不变
+curl -s -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d @examples/request_counter_ingest_batch2.json | python -m json.tool
+# → accepted_count=0, duplicate_count=3
+
+# 4) 查询最新完整计算结果（point_count=已接收点数，intervals/epochs 与无状态接口同构）
+curl -s http://localhost:8000/api/v1/counter-series/$SERIES | python -m json.tool
+
+# 5) 同时间戳异值 → 409，整批回滚（同批的新点也不写入）
+curl -s -X POST http://localhost:8000/api/v1/counter-series/$SERIES/points \
+  -H "Content-Type: application/json" \
+  -d '{"max_counter": 1000, "wrap_tolerance": 5, "max_gap_seconds": 300,
+       "points": [{"timestamp": "2026-09-22T00:03:00Z", "value": 9.0}]}'
+# → 409 detail: 计数器序列 ... 存在同时间戳异值读数：
+#   2026-09-22T00:03:00+00:00: 已归档=5 本次提交=9；同值重复为幂等，异值冲突整批回滚
+
+# 6) 参数与首次不一致（或省略已设置的可选项）→ 409；未知序列查询 → 404；空批次 → 422
+curl -i http://localhost:8000/api/v1/counter-series/never-seen-series
+# → HTTP 404  计数器序列不存在: never-seen-series
+```
+
+分批提交乱序、重叠、断档的行为要点：
+
+- **乱序**：每批提交都会把新点按时间插入合并序列并重算，先到 00:04 后补 00:03 与一次性按序提交 6 点的结果完全相同（可用无状态接口对同样 6 点计算，结果逐项一致）；
+- **重叠幂等**：同一时间戳提交相同值任意次都安全，只计 `duplicate_count`；批次内把同一个点写两遍（同值）也只接收一次；
+- **回卷 / 断档参数沿用首次提交**：后续批次即使不传参数也按首次参数重算，但**显式参数与首次不同会返回 409**（包括把首次的 `max_counter=1000` 改成 `null`）；
+- **断档重算**：晚些时候补一个超过 `max_gap_seconds` 的远点，对应区间自动标 `unknown` 并在其两侧切断 epoch；
+- **存储**：读数以 `(series_id, epoch 微秒时刻, value)` 存于 `counter_points`，最新结果存于 `counter_series`；Docker 部署下随命名卷 `ts_data` 持久化，`docker compose down -v` 清空。
+
 ### 内联 JSON 示例
 
 ```bash
@@ -823,6 +958,19 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 整体复杂度 `O(n)`（`n` 为读数点数）；接口无状态，结果不写入 SQLite。
 
+### 计数器读数归档与增量重算（`POST /api/v1/counter-series/{id}/points`）
+
+1. 接口层把批次内每个时间戳解析为 **epoch 整数微秒**（`value` 拒绝 NaN / Infinity，时间戳无法解析返回 422），连同值一起交给存储层。
+2. 存储层以 `BEGIN IMMEDIATE` 开启单事务，读 `counter_series` 行：不存在则以本次提交参数准备创建；存在则把已持久化的 `(max_counter, wrap_tolerance, max_gap_seconds)` 三元组与本次提交做**精确比较**（`null` 按值参与比较），不一致立即抛参数冲突（409）并回滚。
+3. 读取该序列 `counter_points` 中全部 `(ts_us, value)` 作为合并字典，顺序处理批次各点：
+   - 时间戳不在字典 → 加入待插入集合、`accepted_count++`；
+   - 时间戳已在字典且值相等（批次内重复或与已归档点重复）→ `duplicate_count++`；
+   - 值不等 → 记录冲突（时刻 / 已归档值 / 提交值）；收集到任何冲突即整体回滚（**先检查后写入**，保证异值 409 时整批不落库）。
+4. `accepted_count > 0` 时批量插入新点，对合并后按 `ts_us` 排序的完整序列调用与无状态接口相同的 `compute_counter_rates`（参数取序列首次提交时持久化的值），把结果 JSON 写入 `counter_series.result_json`、更新 `point_count` 与 `updated_at`，最后提交；全部幂等时直接回读已存结果，不重算、不更新时间戳。
+5. 查询接口只做一次单行读取并返回持久化结果；区间与 epoch 的判定逻辑与「累计计数器速率算法」完全一致，因此同一序列无论怎样分批 / 乱序提交，最终结果都与一次性按序提交相同。
+
+时间戳以整数微秒为存储主键，同一时刻的 ISO 字符串 / epoch 秒 / 毫秒写法都映射到同一键。单次重算 `O(n)`，其中 `n` 为该序列累计已接收点数；单批上限 10000 点。
+
 ## 运行测试
 
 ```bash
@@ -830,7 +978,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、异常段处置工作流（新建检测段默认 open 且 `updated_at` 取创建时间、`open→acknowledged→resolved` 单向推进、同状态幂等重放且仅附非空 `note` 时更新备注、越级/回退 409 且不写入、检测不存在/段序号越界 404、非法状态值与超长备注 422、无异常段检测计数全 0、详情与列表 `status_counts` 随流转实时回显）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）、无状态计数器速率（四类区间 normal/wrap/reset/unknown 的增量与逐区间速率、回卷容差等号边界与单侧超界 / 负后值判 reset、无 `max_counter` 负增量一律 reset 与零增量 normal 零速率、`max_gap` 等号计入与略超限 unknown、unknown/reset 切断 epoch 与 epoch 累计、汇总排除 reset/unknown 及全 unknown 时速率 null，以及接口层的不足 2 点 / 重复时间戳 / value 非有限 / 负或非有限 `max_counter`、`wrap_tolerance`、`max_gap_seconds` / `wrap_tolerance > max_counter` 等 422 校验与乱序提交）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、异常段处置工作流（新建检测段默认 open 且 `updated_at` 取创建时间、`open→acknowledged→resolved` 单向推进、同状态幂等重放且仅附非空 `note` 时更新备注、越级/回退 409 且不写入、检测不存在/段序号越界 404、非法状态值与超长备注 422、无异常段检测计数全 0、详情与列表 `status_counts` 随流转实时回显）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）、无状态计数器速率（四类区间 normal/wrap/reset/unknown 的增量与逐区间速率、回卷容差等号边界与单侧超界 / 负后值判 reset、无 `max_counter` 负增量一律 reset 与零增量 normal 零速率、`max_gap` 等号计入与略超限 unknown、unknown/reset 切断 epoch 与 epoch 累计、汇总排除 reset/unknown 及全 unknown 时速率 null，以及接口层的不足 2 点 / 重复时间戳 / value 非有限 / 负或非有限 `max_counter`、`wrap_tolerance`、`max_gap_seconds` / `wrap_tolerance > max_counter` 等 422 校验与乱序提交）、计数器读数归档（乱序分批提交的按时间合并与受影响区间重算——后补的回卷点把既有 reset 改写为 wrap、重叠批次同值幂等与 `accepted_count`/`duplicate_count` 计数、批次内同值去重、归档结果与无状态接口逐项一致、全幂等重放不刷新 `updated_at`、异值冲突（含批次内自相矛盾）409 且整批回滚不写入、参数三元组不一致（含显式值与 `null` 互换 / 省略已设置项）409、未知序列 404、空批次 / 非有限值 / 无法解析时间戳 / `wrap_tolerance > max_counter` 422、断档参数沿用首次提交使远点标 unknown 并切断出新 epoch、仅 1 点序列空区间摘要、新序列以 `null` 参数持久化后补参数 409）。
 
 ## 备注
 

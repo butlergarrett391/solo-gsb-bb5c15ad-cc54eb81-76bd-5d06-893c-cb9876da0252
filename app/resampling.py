@@ -67,9 +67,13 @@ def _ceildiv(a: int, b: int) -> int:
     return -((-a) // b)
 
 
-def _format_us(t_us: int) -> str:
-    """整数微秒 -> UTC ISO-8601（纯整数日历运算，与其他接口的归一化格式一致）。"""
+def format_epoch_microseconds(t_us: int) -> str:
+    """epoch 整数微秒 -> UTC ISO-8601（纯整数日历运算，与其他接口的归一化格式一致）。"""
     return (_EPOCH + timedelta(microseconds=t_us)).isoformat()
+
+
+# 模块内沿用旧名（与 epoch_microseconds 互为逆运算）
+_format_us = format_epoch_microseconds
 
 
 def resample_series(

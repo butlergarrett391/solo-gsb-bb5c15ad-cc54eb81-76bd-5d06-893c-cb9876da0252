@@ -791,3 +791,92 @@ class CounterRatesResponse(BaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+class CounterSeriesIngestRequest(BaseModel):
+    """按 series_id 归档计数器读数的批次提交请求（回卷/断档参数以首次提交为准）。"""
+
+    points: list[PointIn] = Field(
+        min_length=1,
+        max_length=10_000,
+        description=(
+            "本批提交的累计读数（1~10000 个）：可乱序、可与已归档时间点重叠；"
+            "同时间戳同值为幂等重复，异值整批拒绝（409）；"
+            "时间戳格式与检测接口一致，value 必须为有限数值"
+        ),
+    )
+    max_counter: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "计数器满量程（≥0 且有限）：语义与无状态计数器速率接口一致；"
+            "首次提交时随序列持久化，后续提交必须一致（不一致返回 409）"
+        ),
+    )
+    wrap_tolerance: FiniteFloat = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "回卷容差（≥0 且有限，不可大于 max_counter）；"
+            "首次提交时随序列持久化，后续提交必须一致（不一致返回 409）"
+        ),
+    )
+    max_gap_seconds: FiniteFloat | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "允许计入增量的最大相邻时间跨度（秒，≥0 且有限，含等号）；"
+            "首次提交时随序列持久化，后续提交必须一致（不一致返回 409）"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_wrap_params(self) -> "CounterSeriesIngestRequest":
+        if self.max_counter is not None and self.wrap_tolerance > self.max_counter:
+            raise ValueError(
+                f"wrap_tolerance 不能大于 max_counter"
+                f"（wrap_tolerance={self.wrap_tolerance} > max_counter={self.max_counter}）"
+            )
+        return self
+
+
+class CounterSeriesIngestResponse(BaseModel):
+    """批次提交结果：接收计数 + 重算后的序列摘要。"""
+
+    series_id: str
+    created: bool = Field(description="本次提交是否新建了归档序列（即首次提交）")
+    accepted_count: int = Field(description="本批新接收的点数（不含幂等重复）")
+    duplicate_count: int = Field(
+        description="本批中同时间戳同值的幂等重复点数（含批次内重复与已归档点）"
+    )
+    point_count: int = Field(description="序列累计已接收点数")
+    interval_count: int = Field(description="区间总数（= point_count − 1）")
+    max_counter: float | None = Field(description="序列持久化的满量程；未设置时为 null")
+    wrap_tolerance: float = Field(description="序列持久化的回卷容差")
+    max_gap_seconds: float | None = Field(description="序列持久化的断档上限；未设置时为 null")
+    normal_count: int = Field(description="reason=normal 的区间数")
+    wrap_count: int = Field(description="reason=wrap 的区间数")
+    reset_count: int = Field(description="reason=reset 的区间数")
+    unknown_count: int = Field(description="reason=unknown 的区间数")
+    epoch_count: int = Field(description="连续 epoch 总数")
+    total_delta: float = Field(description="汇总累计增量（仅 normal / wrap 区间）")
+    total_duration_seconds: float = Field(description="已知区间的跨度之和（秒）")
+    rate_per_second: float | None = Field(
+        description="汇总平均速率；无已知区间时为 null"
+    )
+    created_at: str = Field(description="序列创建时间（UTC ISO-8601）")
+    updated_at: str = Field(
+        description="最近一次实际接收新点的时间（UTC ISO-8601）；全幂等提交不刷新"
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class CounterSeriesStateResponse(CounterRatesResponse):
+    """归档序列的最新完整计算结果（含已接收点数与逐区间 / epoch 明细）。"""
+
+    series_id: str
+    created_at: str = Field(description="序列创建时间（UTC ISO-8601）")
+    updated_at: str = Field(description="最近一次实际接收新点的时间（UTC ISO-8601）")
+
+    model_config = ConfigDict(extra="ignore")
